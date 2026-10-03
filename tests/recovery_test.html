@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Tara Recovery Test</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 700px;
+            margin: 60px auto;
+            padding: 30px;
+        }
+
+        .field {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: bold;
+        }
+
+        input {
+            width: 100%;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+
+        #status {
+            margin-top: 25px;
+            padding: 12px;
+            border: 1px solid #ccc;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Tara Recovery Test</h1>
+
+    <p>
+        This page intentionally disables Tara's
+        highest-confidence field shortly after loading.
+    </p>
+
+    <div class="field">
+        <label for="unstableFirstName">
+            First name:
+        </label>
+
+        <input
+            id="unstableFirstName"
+            name="fname"
+            type="text"
+            value="John"
+        >
+    </div>
+
+    <div class="field">
+        <label for="backupFirstName">
+            First name backup:
+        </label>
+
+        <input
+            id="backupFirstName"
+            name="firstname"
+            type="text"
+            value=""
+        >
+    </div>
+
+    <div id="status">
+        Primary field is currently enabled.
+    </div>
+
+    <script>
+        setTimeout(() => {
+
+            const primary =
+                document.getElementById(
+                    "unstableFirstName"
+                );
+
+            const status =
+                document.getElementById(
+                    "status"
+                );
+
+            if (primary) {
+
+                primary.disabled = true;
+
+                status.textContent =
+                    "Primary field has been disabled. "
+                    + "Tara should recover using the backup field.";
+
+            }
+
+        }, 700);
+    </script>
+
+</body>
+</html>

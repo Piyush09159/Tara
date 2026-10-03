@@ -1,0 +1,11 @@
+<!doctype html><html><head><title>M43 Form</title></head><body>
+<main><h1>Account registration</h1><form id="registration">
+<label for="first">First Name</label><input id="first" name="first_name">
+<label for="last">Last Name</label><input id="last" name="last_name">
+<label for="email">Email Address</label><input id="email" type="email" name="email">
+<span id="password-caption">Password</span><input id="password" type="password" aria-labelledby="password-caption" name="password">
+<label for="country">Country</label><select id="country" name="country"><option>United States</option><option>India</option></select>
+<label><input id="terms" type="checkbox" name="terms"> Terms and Conditions</label>
+<fieldset><legend>Subscription</legend><label><input type="radio" name="plan" value="basic"> Basic</label><label><input id="premium" type="radio" name="plan" value="premium"> Premium</label></fieldset>
+<button type="button" id="submit" onclick="document.title='M43 Submitted';document.getElementById('result').textContent='Submitted'">Submit</button>
+</form><p id="result"></p></main></body></html>
