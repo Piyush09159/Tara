@@ -2,12 +2,29 @@ import time
 
 from agent.action import BrowserAction
 from browser.identity import stable_element_ids
+from browser.readiness import PageReadiness
 
 
 class BrowserActions:
 
-    def __init__(self, page):
+    def __init__(self, page, browser=None):
         self.page = page
+        self.browser = browser
+        self.runtime_telemetry = {"popup_detected": 0, "page_switches": 0,
+                                  "stale_target_events": 0}
+        self.readiness = PageReadiness(page, self._refresh_active_page)
+
+    def _refresh_active_page(self):
+        if not self.browser:
+            return self.page
+        old_page = self.page
+        current = self.browser.refresh_pages()
+        if current is not old_page:
+            self.page = current
+            self.readiness.page = current
+            self.runtime_telemetry["page_switches"] += 1
+            self.runtime_telemetry["popup_detected"] += 1
+        return self.page
 
     # =========================================================
     # ELEMENT LOOKUP
@@ -81,88 +98,7 @@ class BrowserActions:
         stable_for=0.5,
     ):
 
-        start = time.monotonic()
-
-        last_url = self.page.url
-
-        try:
-
-            last_text = (
-                self.page
-                .locator("body")
-                .inner_text(
-                    timeout=3000
-                )
-            )
-
-        except Exception:
-
-            last_text = ""
-
-        stable_since = time.monotonic()
-
-        while (
-            time.monotonic() - start
-            < timeout
-        ):
-
-            time.sleep(0.1)
-
-            current_url = self.page.url
-
-            try:
-
-                current_text = (
-                    self.page
-                    .locator("body")
-                    .inner_text(
-                        timeout=1000
-                    )
-                )
-
-            except Exception:
-
-                current_text = ""
-
-            if (
-                current_url == last_url
-                and current_text == last_text
-            ):
-
-                if (
-                    time.monotonic()
-                    - stable_since
-                    >= stable_for
-                ):
-
-                    return {
-                        "settled": True,
-                        "url": current_url,
-                        "elapsed": round(
-                            time.monotonic()
-                            - start,
-                            3,
-                        ),
-                    }
-
-            else:
-
-                last_url = current_url
-                last_text = current_text
-
-                stable_since = (
-                    time.monotonic()
-                )
-
-        return {
-            "settled": False,
-            "url": self.page.url,
-            "elapsed": round(
-                time.monotonic()
-                - start,
-                3,
-            ),
-        }
+        return self.readiness.wait(timeout=timeout, stable_for=stable_for)
 
     # =========================================================
     # CLICK
@@ -180,6 +116,7 @@ class BrowserActions:
             )
 
         except LookupError as error:
+            self.runtime_telemetry["stale_target_events"] += 1
 
             return {
                 "success": False,
@@ -350,6 +287,7 @@ class BrowserActions:
             "action": "type",
             "element_id": element_id,
             "text": text,
+            "settle": self.wait_for_settle(timeout=2.0),
         }
 
     # =========================================================
@@ -395,7 +333,7 @@ class BrowserActions:
                         "error_type": "SELECT_ERROR", "error": str(error),
                         "element_id": element_id, "option": option}
         return {"success": True, "action": "select", "element_id": element_id,
-                "option": option}
+                "option": option, "settle": self.wait_for_settle(timeout=2.0)}
 
     def check(self, element_id: str):
         element, failure = self._form_control("check", element_id)
@@ -407,7 +345,8 @@ class BrowserActions:
             return {"success": False, "action": "check",
                     "error_type": "CHECK_ERROR", "error": str(error),
                     "element_id": element_id}
-        return {"success": True, "action": "check", "element_id": element_id}
+        return {"success": True, "action": "check", "element_id": element_id,
+                "settle": self.wait_for_settle(timeout=2.0)}
 
     def uncheck(self, element_id: str):
         element, failure = self._form_control("uncheck", element_id)
@@ -419,7 +358,8 @@ class BrowserActions:
             return {"success": False, "action": "uncheck",
                     "error_type": "UNCHECK_ERROR", "error": str(error),
                     "element_id": element_id}
-        return {"success": True, "action": "uncheck", "element_id": element_id}
+        return {"success": True, "action": "uncheck", "element_id": element_id,
+                "settle": self.wait_for_settle(timeout=2.0)}
 
     # =========================================================
     # PRESS

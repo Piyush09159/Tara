@@ -13,6 +13,9 @@ class ActionProgress(BaseModel):
 class TaskExecutionState(BaseModel):
     task: str
     current_goal_id: Optional[int] = None
+    blocked_goal_ids: List[int] = Field(default_factory=list)
+    dynamically_added_goal_ids: List[int] = Field(default_factory=list)
+    dependency_blockers: Dict[int, str] = Field(default_factory=dict)
     goal_statuses: Dict[int, str] = Field(default_factory=dict)
     completed_goal_ids: List[int] = Field(default_factory=list)
     failed_goal_ids: List[int] = Field(default_factory=list)

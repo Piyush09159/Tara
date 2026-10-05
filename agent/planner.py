@@ -153,6 +153,13 @@ class AgentPlanner:
 
         task_lower = task.lower()
 
+        # Completed actions are compact operational context. They identify
+        # fields already used in this task, not durable browser references.
+        used_type_targets = {
+            action.get("element_id") for action in completed_actions
+            if action.get("action") == "type" and action.get("element_id")
+        }
+
         candidates = []
 
         # =====================================================
@@ -309,6 +316,7 @@ class AgentPlanner:
                     continue
 
                 score = 0
+                score_reasons = []
 
                 semantic = " ".join(
                     str(value or "")
@@ -506,6 +514,7 @@ class AgentPlanner:
                 )
 
                 score = 0
+                score_reasons = []
 
                 # -------------------------------------------------
                 # FIRST NAME
@@ -624,6 +633,43 @@ class AgentPlanner:
 
                 if not field.value:
                     score += 5
+                    score_reasons.append("empty_field")
+
+                # Generic text entry benefits from form sequence context:
+                # prefer an unused compatible field, but never blacklist a
+                # field because a later goal may intentionally edit it.
+                explicit_target = any(name in task_lower for name in
+                                      ("first name", "last name", "email", "password", "search")) or bool(fact_keys)
+                if not explicit_target:
+                    # A human-facing description is stronger evidence than a
+                    # compact technical name. Prefer explicit labels, ARIA
+                    # labels and readable multi-word placeholders; raw names
+                    # remain usable but do not decide an otherwise ambiguous
+                    # generic form-entry goal.
+                    display_label = str(field.label or field.aria_label or field.placeholder or "").strip()
+                    normalized_display = normalize_semantic_key(display_label)
+                    display_words = [word for word in normalized_display.split("_") if word]
+                    if len(display_words) >= 2:
+                        score += 25
+                        score_reasons.append("meaningful_user_facing_label")
+                    elif display_label and len(display_label) >= 6 and not normalized_display.isidentifier():
+                        score += 10
+                        score_reasons.append("readable_field_description")
+                    if field.form_id:
+                        score += 3
+                        score_reasons.append("form_associated_field")
+
+                    if field.id in used_type_targets:
+                        score -= 25
+                        score_reasons.append("previously_used_field_penalty")
+                    else:
+                        score += 12
+                        score_reasons.append("unused_form_field_preference")
+
+                    search_semantics = "search" in normalized_field_semantic or field_type == "search" or field.role == "searchbox"
+                    if search_semantics:
+                        score -= 20
+                        score_reasons.append("search_field_penalty")
 
                 # -------------------------------------------------
                 # CREATE CANDIDATE
@@ -644,6 +690,7 @@ class AgentPlanner:
                         "visible": field.visible,
                         "enabled": field.enabled,
                         "score": score,
+                        "score_reasons": score_reasons,
                     }
 
                     if matching_fact_key:

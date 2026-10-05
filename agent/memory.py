@@ -44,6 +44,10 @@ class WorkingMemory(BaseModel):
 
     execution: Optional[TaskExecutionState] = None
 
+    # Runtime-only counters are compact, serializable diagnostics.  They
+    # intentionally never contain Playwright page objects.
+    runtime_telemetry: Dict[str, Any] = Field(default_factory=dict)
+
     # =========================================================
     # OBSERVATION MEMORY
     # =========================================================
@@ -74,12 +78,25 @@ class WorkingMemory(BaseModel):
                 "value": observation
             }
 
+        # Observations are persisted in checkpoints and supplied to planner
+        # context. Keep the live PageState for the caller, but never retain a
+        # password field's current value in that durable diagnostic state.
+        safe_observation = dict(observation)
+        safe_inputs = []
+        for field in observation.get("inputs", []) if isinstance(observation.get("inputs", []), list) else []:
+            safe_field = dict(field)
+            if str(safe_field.get("type", "")).lower() == "password":
+                safe_field["value"] = "<REDACTED>"
+            safe_inputs.append(safe_field)
+        if safe_inputs:
+            safe_observation["inputs"] = safe_inputs
+
         self.observations.append(
-            observation
+            safe_observation
         )
 
         self.task_context.extract_from_observation(
-            observation,
+            safe_observation,
             step=self.current_step,
         )
 
@@ -128,6 +145,8 @@ class WorkingMemory(BaseModel):
         action: str,
         success: bool,
         navigated: bool,
+        state_changed: bool = False,
+        page_identity: Optional[str] = None,
     ):
         self.browser.record_transition(
             step=self.current_step,
@@ -136,6 +155,8 @@ class WorkingMemory(BaseModel):
             action=action,
             success=success,
             navigated=navigated,
+            state_changed=state_changed,
+            page_identity=page_identity,
         )
 
     # =========================================================

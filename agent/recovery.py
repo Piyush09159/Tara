@@ -97,6 +97,13 @@ class RecoveryManager:
 
         if normalized == "ELEMENT_DISABLED":
 
+            if retry_count <= 1:
+                return RecoveryDecision(
+                    error_type=normalized, strategy="wait_and_reobserve",
+                    blacklist_action=False, wait_seconds=0.35,
+                    reason="The control may become enabled after a bounded readiness wait.",
+                )
+
             return RecoveryDecision(
                 error_type=normalized,
                 strategy="blacklist_and_replan",
@@ -221,6 +228,13 @@ class RecoveryManager:
                     "The page state could not be read. "
                     "Wait briefly and observe again."
                 ),
+            )
+
+        if normalized in {"PAGE_NOT_READY", "DOM_CHANGED", "POPUP_OPENED", "REDIRECT_IN_PROGRESS"}:
+            return RecoveryDecision(
+                error_type=normalized, strategy="wait_and_reobserve",
+                blacklist_action=False, wait_seconds=0.25,
+                reason="Browser runtime state is transient; wait briefly then re-observe current page.",
             )
 
         # =====================================================

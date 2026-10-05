@@ -3,6 +3,9 @@ from agent.goals import GoalDecomposer
 from agent.recovery import RecoveryManager
 from agent.memory import WorkingMemory
 from agent.execution import ActionProgress, TaskExecutionState
+from agent.checkpoint import CheckpointManager, TaskCheckpoint
+from agent.trace import AgentTrace, FailureRecord, RunSummary
+from time import perf_counter
 
 
 class AgentLoop:
@@ -42,20 +45,38 @@ class AgentLoop:
         # for debugging and inspection.
         self.last_memory = None
         self.last_execution_state = None
+        self.last_goal_plan = None
+        self.checkpoints = CheckpointManager()
+        self.last_trace = None
+        self.last_trace_path = None
+        self.last_run_summary = None
+        self._trace_checkpoints_created = 0
+        self._trace_checkpoints_restored = 0
 
     # =========================================================
     # RUN
     # =========================================================
 
-    def run(self, task):
+    def run(self, task, resume_from=None):
+
+        started_at = perf_counter()
+        trace = AgentTrace(task=task)
+        self.last_trace = trace
+        self.last_trace_path = None
+        self._trace_checkpoints_created = 0
+        self._trace_checkpoints_restored = 0
+        trace.record("task_started", task=task, resumed=bool(resume_from))
 
         # -----------------------------------------------------
         # CREATE GOAL PLAN
         # -----------------------------------------------------
 
-        goal_plan = self.decomposer.decompose(
-            task
-        )
+        checkpoint = self.checkpoints.load(resume_from) if isinstance(resume_from, str) else resume_from
+        goal_plan = checkpoint.goal_plan if checkpoint else self.decomposer.decompose(task)
+        if checkpoint:
+            self._trace_checkpoints_restored += 1
+            trace.record("checkpoint_restored", checkpoint_id=checkpoint.checkpoint_id,
+                         url=checkpoint.current_url, reason=checkpoint.checkpoint_reason)
 
         if not goal_plan.goals:
 
@@ -64,23 +85,25 @@ class AgentLoop:
                 "the task."
             )
 
-            return False
+            return self._finish_run(False, task, started_at, trace, None, None)
 
         # -----------------------------------------------------
         # WORKING MEMORY
         # -----------------------------------------------------
 
-        memory = WorkingMemory(
-            task=task
-        )
+        memory = checkpoint.working_memory if checkpoint else WorkingMemory(task=task)
+        if checkpoint:
+            # Failure history is useful diagnostic context, but a previous
+            # session's element ID cannot blacklist a freshly observed target.
+            for failed_action in memory.failed_actions:
+                failed_action["blacklist"] = False
 
         self.last_memory = memory
-        execution = TaskExecutionState(
-            task=task,
-            goal_statuses={goal.id: "pending" for goal in goal_plan.goals},
-        )
+        execution = checkpoint.execution_state if checkpoint else TaskExecutionState(
+            task=task, goal_statuses={goal.id: "pending" for goal in goal_plan.goals})
         memory.execution = execution
         self.last_execution_state = execution
+        self.last_goal_plan = goal_plan
 
         retry_counts = {}
         pending_retry_action = None
@@ -124,6 +147,17 @@ class AgentLoop:
             # =================================================
             # OBSERVE
             # =================================================
+
+            # BrowserActions may have promoted a popup/new tab to the active
+            # page during the previous settle cycle.  Reader remains a thin
+            # current-page view and is updated without serializing page refs.
+            if hasattr(self.reader, "page") and hasattr(self.actions, "page"):
+                self.reader.page = self.actions.page
+
+            # A short bounded settle captures delayed/SPA mutations before
+            # planning without turning observation into fixed sleep logic.
+            if hasattr(self.actions, "wait_for_settle"):
+                self.actions.wait_for_settle(timeout=0.6, stable_for=0.15)
 
             try:
 
@@ -190,6 +224,9 @@ class AgentLoop:
             # STORE OBSERVATION
             # =================================================
 
+            # Facts are semantic TaskFacts only; this event deliberately
+            # excludes selectors, element IDs and DOM paths.
+            known_before = {(fact.key, fact.value) for fact in memory.task_context.facts}
             memory.add_observation(
                 page_state,
             )
@@ -197,8 +234,25 @@ class AgentLoop:
             memory.add_browser_snapshot(
                 page_state,
             )
+            readiness = getattr(self.actions, "readiness", None)
+            action_runtime = getattr(self.actions, "runtime_telemetry", {})
+            memory.runtime_telemetry = {
+                **getattr(readiness, "telemetry", {}),
+                **action_runtime,
+                "active_page_count": len(getattr(getattr(self.actions, "browser", None), "pages", []) or [self.actions.page]),
+                "reobservations": step,
+            }
             snapshot = memory.browser.recent_snapshot()
             current_fingerprint = snapshot.fingerprint if snapshot else ""
+            trace.record("observation", step=step, url=page_state.url,
+                         title=page_state.title, page_fingerprint=current_fingerprint,
+                         page_identity=str(id(getattr(self.actions, "page", None))),
+                         runtime=memory.runtime_telemetry)
+            for fact in memory.task_context.facts:
+                if (fact.key, fact.value) not in known_before:
+                    trace.record("fact_discovered", step=step, fact_key=fact.key,
+                                 source_url=fact.source_url, source_step=fact.source_step,
+                                 confidence=fact.confidence)
 
             print(
                 f"[Observe] "
@@ -214,9 +268,13 @@ class AgentLoop:
             # CURRENT GOAL
             # =================================================
 
-            current_goal = (
-                goal_plan.current_goal()
-            )
+            current_goal = goal_plan.current_goal(memory)
+
+            for goal in goal_plan.goals:
+                ready, reason = goal_plan.readiness(goal, memory)
+                if not ready and not goal.completed:
+                    execution.dependency_blockers[goal.id] = reason
+            execution.blocked_goal_ids = [goal.id for goal in goal_plan.goals if goal.status == "BLOCKED"]
 
             if current_goal is None:
 
@@ -228,7 +286,7 @@ class AgentLoop:
                     memory
                 )
 
-                return True
+                return self._finish_run(True, task, started_at, trace, memory, execution)
 
             memory.current_goal_id = (
                 current_goal.id
@@ -236,6 +294,11 @@ class AgentLoop:
             execution.activate_goal(current_goal.id)
             execution.last_url = page_state.url
             execution.last_fingerprint = current_fingerprint
+            trace.record("goal_activated", step=step, goal_id=current_goal.id,
+                         description=current_goal.description,
+                         prerequisites=current_goal.prerequisites,
+                         required_fact=current_goal.required_fact,
+                         blockers=execution.dependency_blockers.get(current_goal.id, ""))
 
             print(
                 f"[Goal] "
@@ -304,7 +367,9 @@ class AgentLoop:
                     f"failed."
                 )
 
-                return False
+                trace.record("goal_failed", step=step, goal_id=current_goal.id,
+                             reason=goal_status.reason)
+                return self._finish_run(False, task, started_at, trace, memory, execution)
 
             # =================================================
             # RETRY LIMIT
@@ -326,7 +391,9 @@ class AgentLoop:
                     f"exceeded retry limit."
                 )
 
-                return False
+                trace.record("goal_failed", step=step, goal_id=current_goal.id,
+                             reason="retry_limit")
+                return self._finish_run(False, task, started_at, trace, memory, execution)
 
             # =================================================
             # THINK
@@ -367,12 +434,27 @@ class AgentLoop:
                         allow_deterministic=self.deterministic_selection,
                     )
 
+                diagnostics = dict(getattr(self.planner, "diagnostics", {}))
+                trace.record("planner_called", step=step, goal_id=current_goal.id,
+                             decision_type=getattr(self.planner, "last_decision_type", None),
+                             diagnostics=diagnostics)
+                trace.record("candidate_generated", step=step, goal_id=current_goal.id,
+                             candidate_count_before_filter=diagnostics.get("candidate_count_before_filter", 0),
+                             candidate_count_after_filter=diagnostics.get("candidate_count_after_filter", 0),
+                             top_k=diagnostics.get("top_k_count", 0))
+
                 if self.planner.last_decision_type == "deterministic":
                     execution.deterministic_decisions += 1
                 else:
                     execution.planner_calls += 1
 
             except Exception as error:
+
+                planning_error_type = (
+                    "PAGE_NOT_READY"
+                    if "No valid action candidates remain" in str(error)
+                    else "PLANNER_ERROR"
+                )
 
                 print(
                     "[Think] ❌ "
@@ -398,7 +480,7 @@ class AgentLoop:
 
                 decision = (
                     self.recovery.decide(
-                        "PLANNER_ERROR",
+                        planning_error_type,
                         retry_number,
                     )
                 )
@@ -408,7 +490,7 @@ class AgentLoop:
                     "stage": "planning",
                     "success": False,
                     "error_type": (
-                        "PLANNER_ERROR"
+                        planning_error_type
                     ),
                     "error": str(error),
                     "blacklist": (
@@ -424,11 +506,16 @@ class AgentLoop:
                     {
                         "step": step,
                         "goal_id": current_goal.id,
-                        "error_type": "PLANNER_ERROR",
+                        "error_type": planning_error_type,
                         "strategy": decision.strategy,
                         "reason": decision.reason,
                     }
                 )
+                trace.record("action_failed", step=step, goal_id=current_goal.id,
+                             failure=self._failure("planner_failure", planning_error_type, step, current_goal.id,
+                                                   {}, decision.strategy).model_dump())
+                trace.record("recovery_started", step=step, goal_id=current_goal.id,
+                             strategy=decision.strategy, reason=decision.reason)
                 execution.recovery_count += 1
                 execution.recovery_replans += 1
 
@@ -460,6 +547,10 @@ class AgentLoop:
             action_dict = (
                 action.model_dump()
             )
+            trace_action, sensitive = self._trace_action(action_dict, page_state)
+            trace.record("action_selected", step=step, goal_id=current_goal.id,
+                         action=trace_action, sensitive=sensitive, url=page_state.url,
+                         page_fingerprint=current_fingerprint)
 
             # -------------------------------------------------
             # ADD CLICK TARGET TEXT
@@ -528,6 +619,11 @@ class AgentLoop:
                 print(
                     f"[Act] Result: {result}"
                 )
+                trace.record("action_executed", step=step, goal_id=current_goal.id,
+                             action=trace_action, result=result, old_url=previous_url,
+                             new_url=result.get("new_url", previous_url),
+                             navigation_detected=result.get("navigated", False),
+                             runtime=getattr(self.actions, "runtime_telemetry", {}))
 
             except Exception as error:
 
@@ -587,6 +683,11 @@ class AgentLoop:
                         "reason": decision.reason,
                     }
                 )
+                trace.record("action_failed", step=step, goal_id=current_goal.id,
+                             failure=self._failure("task_failure", "UNEXPECTED_ERROR", step, current_goal.id,
+                                                   trace_action, decision.strategy).model_dump())
+                trace.record("recovery_started", step=step, goal_id=current_goal.id,
+                             strategy=decision.strategy, reason=decision.reason)
 
                 print(
                     "[Recovery] "
@@ -692,6 +793,13 @@ class AgentLoop:
                         "reason": decision.reason,
                     }
                 )
+                trace.record("action_failed", step=step, goal_id=current_goal.id,
+                             failure=self._failure(self._failure_category(error_type), error_type, step,
+                                                   current_goal.id, trace_action, decision.strategy).model_dump())
+                trace.record("recovery_started", step=step, goal_id=current_goal.id,
+                             strategy=decision.strategy, reason=decision.reason,
+                             retry_same_action=decision.retry_same_action,
+                             blacklist_action=decision.blacklist_action)
                 execution.recovery_count += 1
                 execution.recovery_replans += 1
 
@@ -768,6 +876,12 @@ class AgentLoop:
                 "navigated",
                 False,
             )
+            settle = result.get("settle", {})
+            transition_state_changed = bool(
+                transition_navigated
+                or settle.get("fingerprint")
+                and settle.get("fingerprint") != current_fingerprint
+            )
 
             memory.add_browser_transition(
                 from_url=previous_url,
@@ -775,11 +889,16 @@ class AgentLoop:
                 action=transition_action,
                 success=transition_success,
                 navigated=transition_navigated,
+                state_changed=transition_state_changed,
+                page_identity=str(id(getattr(self.actions, "page", None))),
             )
 
             # =================================================
             # VERIFY
             # =================================================
+
+            if hasattr(self.reader, "page") and hasattr(self.actions, "page"):
+                self.reader.page = self.actions.page
 
             try:
 
@@ -926,6 +1045,9 @@ class AgentLoop:
                     f"Goal {current_goal.id} "
                     f"completed."
                 )
+                trace.record("goal_completed", step=step, goal_id=current_goal.id,
+                             verification_result=post_status.status, reason=post_status.reason,
+                             progress_signals=progress.signals)
 
                 continue
 
@@ -1029,7 +1151,9 @@ class AgentLoop:
                     "status": "failed",
                     "reason": "Stuck: bounded no-progress/recovery budget exceeded.",
                 })
-                return False
+                trace.record("goal_failed", step=step, goal_id=current_goal.id,
+                             reason="bounded_no_progress_recovery_budget")
+                return self._finish_run(False, task, started_at, trace, memory, execution)
 
         # =====================================================
         # FINAL RESULT
@@ -1045,7 +1169,7 @@ class AgentLoop:
                 memory
             )
 
-            return True
+            return self._finish_run(True, task, started_at, trace, memory, execution)
 
         print(
             "\n⚠️ Maximum agent steps reached."
@@ -1061,7 +1185,65 @@ class AgentLoop:
             memory
         )
 
-        return False
+        return self._finish_run(False, task, started_at, trace, memory, execution)
+
+    def _failure_category(self, error_type):
+        mapping = {
+            "ELEMENT_NOT_FOUND": "element_not_found", "ELEMENT_NOT_VISIBLE": "element_not_visible",
+            "ELEMENT_DISABLED": "element_disabled", "STALE_TARGET": "stale_target",
+            "NAVIGATION_ERROR": "navigation_failure", "PAGE_NOT_READY": "readiness_failure",
+            "TIMEOUT": "timeout", "PLANNER_ERROR": "planner_failure",
+        }
+        return mapping.get(str(error_type).upper(), "task_failure")
+
+    def _failure(self, category, error_type, step, goal_id, action, recovery_strategy):
+        return FailureRecord(category=category, error_type=error_type, step=step,
+                             goal_id=goal_id, action=action,
+                             recovery_strategy=recovery_strategy)
+
+    def _trace_action(self, action, page_state):
+        """Redact text only when it targets a current password control."""
+        copied = dict(action)
+        sensitive = any(field.id == action.get("element_id") and
+                        str(field.type or "").lower() == "password"
+                        for field in page_state.inputs)
+        if sensitive and "text" in copied:
+            copied["text"] = "<REDACTED>"
+        return copied, sensitive
+
+    def _finish_run(self, passed, task, started_at, trace, memory, execution):
+        """Finalize diagnostics while retaining AgentLoop's bool API."""
+        if memory is None or execution is None:
+            summary = RunSummary(run_id=trace.run_id, task=task, result="FAIL")
+        else:
+            diagnostics = getattr(self.planner, "diagnostics", {})
+            failures = []
+            for item in memory.failed_actions:
+                failures.append(self._failure(self._failure_category(item.get("error_type", "")),
+                    item.get("error_type", ""), item.get("step", memory.current_step),
+                    item.get("goal_id"), item, item.get("recovery_strategy", "")))
+            summary = RunSummary(run_id=trace.run_id, task=task, result="PASS" if passed else "FAIL",
+                total_steps=execution.total_steps, completed_goals=len(execution.completed_goal_ids),
+                failed_goals=len(execution.failed_goal_ids), planner_calls=execution.planner_calls,
+                deterministic_decisions=execution.deterministic_decisions,
+                fallbacks=diagnostics.get("fallback_selections", 0), recovery_count=execution.recovery_count,
+                no_progress_count=execution.no_progress_count, repeated_action_count=execution.repeated_action_count,
+                facts_discovered=len(memory.task_context.facts), checkpoints_created=self._trace_checkpoints_created,
+                checkpoints_restored=self._trace_checkpoints_restored,
+                duration_seconds=perf_counter() - started_at,
+                active_page_count=len(getattr(getattr(self.actions, "browser", None), "pages", []) or [self.actions.page]),
+                stale_target_events=getattr(self.actions, "runtime_telemetry", {}).get("stale_target_events", 0),
+                failures=failures)
+        self.last_run_summary = summary
+        trace.record("task_completed" if passed else "task_failed", step=summary.total_steps,
+                     result=summary.result, summary=summary.model_dump(mode="json"))
+        # A trace is most useful when it survives the process that produced
+        # it. Failure to write diagnostics must never alter task behaviour.
+        try:
+            self.last_trace_path = trace.save()
+        except OSError:
+            self.last_trace_path = None
+        return passed
 
     def _action_is_current(
         self,
@@ -1088,6 +1270,31 @@ class AgentLoop:
             and element.enabled
             for element in current_elements
         )
+
+    def create_checkpoint(self, reason="manual"):
+        """Persist semantic state only; live browser references are excluded."""
+        if not self.last_memory or not self.last_goal_plan or not self.last_execution_state:
+            raise RuntimeError("No active task state is available to checkpoint.")
+        checkpoint = TaskCheckpoint(
+            task=self.last_memory.task, goal_plan=self.last_goal_plan,
+            working_memory=self.last_memory, execution_state=self.last_execution_state,
+            current_url=getattr(getattr(self.actions, "page", None), "url", ""),
+            active_page_identity=str(id(getattr(self.actions, "page", None))),
+            checkpoint_reason=reason,
+        )
+        checkpoint_id = self.checkpoints.save(checkpoint)
+        self._trace_checkpoints_created += 1
+        if self.last_trace:
+            self.last_trace.record("checkpoint_created", step=self.last_memory.current_step,
+                                   checkpoint_id=checkpoint_id, reason=reason,
+                                   url=checkpoint.current_url)
+        return checkpoint_id
+
+    def resume_from_checkpoint(self, checkpoint_id):
+        checkpoint = self.checkpoints.load(checkpoint_id)
+        # Retry/no-progress counters are session-scoped, so run() rebuilds its
+        # transient retry map while restoring semantic execution state.
+        return self.run(checkpoint.task, resume_from=checkpoint)
 
     def _evaluate_progress(
         self,

@@ -47,6 +47,8 @@ class BrowserTransition(BaseModel):
     success: bool
 
     navigated: bool = False
+    state_changed: bool = False
+    page_identity: Optional[str] = None
 
 
 class BrowserMemory(BaseModel):
@@ -125,7 +127,9 @@ class BrowserMemory(BaseModel):
                     "label": field.label,
                     "aria_label": field.aria_label,
                     "placeholder": field.placeholder,
-                    "value": field.value,
+                    # Browser snapshots are persisted/planner-visible. A
+                    # password value belongs only in the live browser field.
+                    "value": "<REDACTED>" if str(field.type or "").lower() == "password" else field.value,
                     "visible": field.visible,
                     "enabled": field.enabled,
                 }
@@ -301,6 +305,8 @@ class BrowserMemory(BaseModel):
         action: str,
         success: bool,
         navigated: bool = False,
+        state_changed: bool = False,
+        page_identity: Optional[str] = None,
     ):
 
         transition = BrowserTransition(
@@ -310,6 +316,8 @@ class BrowserMemory(BaseModel):
             action=action,
             success=success,
             navigated=navigated,
+            state_changed=state_changed,
+            page_identity=page_identity,
         )
 
         self.transitions.append(

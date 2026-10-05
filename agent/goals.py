@@ -1,5 +1,6 @@
+import json
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -13,10 +14,67 @@ class Goal(BaseModel):
     target: Optional[str] = None
     fact_key: Optional[str] = None
     completed: bool = False
+    # Graph metadata is deliberately additive so existing goal consumers keep
+    # their lightweight id/description/goal_type contract.
+    semantic_target: Optional[str] = None
+    expected_value: Optional[str] = None
+    required_fact: Optional[str] = None
+    prerequisites: List[int] = Field(default_factory=list)
+    verification_condition: Optional[str] = None
+    status: str = "PENDING"
+    priority: int = 0
+    dynamically_added: bool = False
 
 
 class GoalPlan(BaseModel):
     goals: List[Goal] = Field(default_factory=list)
+
+    def validate_graph(self):
+        ids = [goal.id for goal in self.goals]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Goal graph contains duplicate goal IDs.")
+        known = set(ids)
+        for goal in self.goals:
+            unknown = set(goal.prerequisites) - known
+            if unknown:
+                raise ValueError(f"Goal {goal.id} has invalid dependencies: {sorted(unknown)}")
+            if goal.id in goal.prerequisites:
+                raise ValueError(f"Goal {goal.id} cannot depend on itself.")
+        visiting, visited = set(), set()
+        def visit(goal_id):
+            if goal_id in visiting:
+                raise ValueError("Goal graph contains a dependency cycle.")
+            if goal_id in visited: return
+            visiting.add(goal_id)
+            goal = next(item for item in self.goals if item.id == goal_id)
+            for dependency in goal.prerequisites: visit(dependency)
+            visiting.remove(goal_id); visited.add(goal_id)
+        for goal_id in ids: visit(goal_id)
+        return True
+
+    def readiness(self, goal: Goal, memory=None):
+        completed = {item.id for item in self.goals if item.completed or item.status == "COMPLETED"}
+        missing = [item for item in goal.prerequisites if item not in completed]
+        if missing:
+            return False, f"Waiting for prerequisites: {missing}."
+        required_fact = goal.required_fact or (goal.fact_key if goal.goal_type == "type_from_fact" else None)
+        if required_fact and (memory is None or memory.get_task_fact(required_fact) is None):
+            return False, f"Waiting for required fact: {required_fact}."
+        return True, "Prerequisites and required facts are available."
+
+    def ready_goals(self, memory=None):
+        ready = []
+        for goal in self.goals:
+            if goal.completed or goal.status in {"COMPLETED", "FAILED"}: continue
+            is_ready, reason = self.readiness(goal, memory)
+            goal.status = "PENDING" if is_ready else "BLOCKED"
+            if is_ready: ready.append(goal)
+        return sorted(ready, key=lambda item: (item.priority, item.id))
+
+    def add_goal(self, goal: Goal):
+        goal.dynamically_added = True
+        self.goals.append(goal)
+        self.validate_graph()
 
     @property
     def completed_count(self) -> int:
@@ -36,11 +94,9 @@ class GoalPlan(BaseModel):
             and self.completed_count == self.total_count
         )
 
-    def current_goal(self) -> Optional[Goal]:
-        for goal in self.goals:
-            if not goal.completed:
-                return goal
-        return None
+    def current_goal(self, memory=None) -> Optional[Goal]:
+        ready = self.ready_goals(memory)
+        return ready[0] if ready else None
 
 
 class GoalDecomposer:
@@ -392,4 +448,31 @@ class GoalDecomposer:
 
             next_id += 1
 
-        return GoalPlan(goals=goals)
+        plan = GoalPlan(goals=goals)
+        # A fact-backed entry is explicitly blocked until semantic memory has
+        # acquired it; ordinary previous goals retain their established order.
+        previous_id = None
+        for goal in plan.goals:
+            if previous_id is not None:
+                goal.prerequisites = [previous_id]
+            if goal.goal_type == "type_from_fact":
+                goal.required_fact = goal.fact_key
+            goal.semantic_target = goal.fact_key or goal.target
+            goal.expected_value = goal.target if goal.goal_type in {"type", "select"} else None
+            previous_id = goal.id
+        plan.validate_graph()
+        return plan
+
+    def decompose_with_llm(self, task: str, llm):
+        """Validate optional structured Qwen decomposition; never execute raw text."""
+        prompt = ("Return JSON only: {\"goals\":[{\"id\":1,\"description\":\"...\","
+                  "\"goal_type\":\"click|type|select|check|navigate|type_from_fact\","
+                  "\"target\":\"...\",\"prerequisites\":[]}]}. Task: " + task)
+        try:
+            raw = json.loads(llm.generate(prompt))
+            goals = [Goal.model_validate(item) for item in raw.get("goals", [])]
+            plan = GoalPlan(goals=goals); plan.validate_graph()
+            if not goals: raise ValueError("No LLM goals")
+            return plan
+        except Exception:
+            return self.decompose(task)
